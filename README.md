@@ -17,6 +17,11 @@ reads a skill's `description` to decide when it applies.
   `<project>-<suffix>.localhost` URL. Handles per-worktree `.env.local`, isolated
   TanStack DevTools ports, and the better-auth origin env vars. The project name
   is derived from the git repo, so it works in any project without editing.
+- **[pr-review-log](pr-review-log/SKILL.md)** — Summarize the GitHub PR reviews
+  you submitted on a repo over a time window, grouped by PR with issue numbers,
+  local-time review sessions, event counts, and approve/changes-requested
+  verdicts. Defaults to last week; resolves the repo from the current project, so
+  it works in any project without editing.
 
 ## Install
 
