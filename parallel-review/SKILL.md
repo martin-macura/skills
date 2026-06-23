@@ -30,6 +30,15 @@ Skip for trivial one-line changes.
   - **Exception:** when the disagreement is a *checkable fact*, verify it instead of escalating. Classic trap: a reviewer flags a "removed X regression" that's actually `main` advancing past the branch base (`git diff main..HEAD` attributes main's additions to your side). When a reviewer flags a removal you didn't make, check whether the branch is behind main first.
 - Add tests for gaps the reviewers converge on; re-run typecheck / lint / tests after applying fixes.
 
+## Working on the branch locally (run / verify / edit)
+
+Once the authorship gate passes and you need to run, verify, or edit the PR branch, do it in an **isolated git worktree** — never switch the main checkout onto the PR branch. Switching the primary checkout's branch disrupts the user's workspace and any other agents working in it.
+
+- **Pull latest first.** `git fetch origin <branch>` and base the checkout on the freshly-fetched `origin/<branch>`, so you review the current head — not a stale local copy.
+- **Isolated, clean checkout.** `git worktree add <path> origin/<branch>` (detached) or a throwaway branch; the branch must not already be checked out elsewhere. Put `<path>` outside the repo tree to avoid recursive tsconfig / `.claude/worktrees` scanning.
+- **Don't disrupt others.** Unique worktree path and unique ports (DevTools / dev-server). Never clobber or remove worktrees, branches, or processes you didn't create this session.
+- **Restore + clean up.** Leave the main checkout on the branch you found it; `git worktree remove <path>` when done. A fresh worktree has no `node_modules` — install or share per the project before building/running.
+
 ## Honesty
 
 If you only managed to run one agent (or claimed three but ran one), say so and run the full three — don't report a single review as if it were the panel.
