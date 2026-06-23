@@ -139,7 +139,7 @@ def main():
 
     rows = []
     for number in numbers:
-        jq = f'.[] | select(.user.login=="{login}") | "\\(.submitted_at)|\\(.state)"'
+        jq = f'.[] | select(.user.login=="{login}" and .submitted_at != null) | "\\(.submitted_at)|\\(.state)"'
         lines = gh(['api', f'repos/{repo}/pulls/{number}/reviews', '--paginate', '--jq', jq], fatal=False) or ''
         events = []
         for line in lines.splitlines():
@@ -147,6 +147,8 @@ def main():
                 continue
 
             iso, state = line.split('|')
+            if iso == 'null':
+                continue
             local = parse_local(iso)
             if start <= local < end:
                 events.append((local, state))
