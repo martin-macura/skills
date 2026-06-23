@@ -19,10 +19,10 @@ Once the server is up, the recipe opens the URL in **Chrome Canary** automatical
 
 ## Who's looking: you vs. the user
 
-Decide the audience before running, and set `OPEN_BROWSER` accordingly:
+Decide the audience before running, and pass the `--open` flag to the launcher accordingly:
 
-- **The user wants to look** — they asked to preview a worktree, walk a flow, or get a URL to hand off. Auto-open Chrome Canary (`OPEN_BROWSER=1`, the default).
-- **You (Claude) want to look** — you're starting the server so *you* can review/screenshot/drive the app yourself through the preview MCP tools (`mcp__Claude_Preview__*`) or Claude-in-Chrome. **Do not** call `open` — popping Chrome Canary on the user's screen is noise they didn't ask for. Set `OPEN_BROWSER=0`, then point your own preview tooling at `$PORTLESS_URL`.
+- **The user wants to look** — they asked to preview a worktree, walk a flow, or get a URL to hand off. Run `bash "$SCRIPT" --open` so Chrome Canary opens once the server is serving.
+- **You (Claude) want to look** — you're starting the server so *you* can review/screenshot/drive the app yourself through the preview MCP tools (`mcp__Claude_Preview__*`) or Claude-in-Chrome. **Do not** pass `--open` — popping Chrome Canary on the user's screen is noise they didn't ask for. Run `bash "$SCRIPT"` (no flag), then point your own preview tooling at the URL.
 
 When in doubt — e.g. the request is "see if the app works" with no stated audience — assume you're reviewing it yourself and skip the open; surface the URL in chat so the user can open it too if they want.
 
@@ -38,6 +38,8 @@ Everything is derived automatically — you normally run the recipe as-is, no va
 4. **`.env.local`** — required by `yarn dev` via `dotenvx`. Git worktrees don't inherit `.env.local` from the main checkout, so the recipe copies it from the main checkout if it's missing. (Override the source path if your main checkout lives elsewhere.)
 
 ## The recipe
+
+Two steps: **(1)** generate a per-app launcher script — once — with the derived values (app name, URL, paths, DevTools base port) and its own pathname inlined; **(2)** run it. On later runs the script already exists, so you skip straight to step 2. All the project/branch derivation happens at generation time and is baked in, so the **script itself only** picks a free DevTools port, starts the server behind portless, and — when passed `--open` — opens Chrome Canary once the server is actually serving.
 
 ```bash
 # --- derive a stable project name + main checkout (works in linked worktrees too) ---
@@ -58,49 +60,79 @@ SLUG=${SLUG%-}                        # re-trim if the length cap left a trailin
 APP_NAME="$PROJECT-$SLUG"             # portless app name, e.g. siegl-app-728-admin-filtration
 PORTLESS_URL="https://$APP_NAME.localhost:1355"  # portless's default HTTPS port is 1355
 
-# .env.local — yarn dev needs it (via dotenvx); worktrees don't inherit it, so copy from the main checkout
-test -f .env.local || cp "$MAIN_CHECKOUT/.env.local" .env.local
-
-# DevTools port — needs a number: first number in the slug (the issue #), else a stable hash. See below.
+# DevTools base port — first number in the slug (the issue #), else a stable hash. See below.
 NUM=$(printf '%s' "$SLUG" | grep -oE '[0-9]+' | head -1)
 [ -z "$NUM" ] && NUM=$(printf '%s' "$SLUG" | cksum | cut -d' ' -f1)
 DEVTOOLS_PORT=$((42000 + NUM % 1000))
-# Avoid the default 42069 collision if NUM mod 1000 happens to be 69.
-[ "$DEVTOOLS_PORT" = "42069" ] && DEVTOOLS_PORT=42070
+[ "$DEVTOOLS_PORT" = "42069" ] && DEVTOOLS_PORT=42070   # avoid the default 42069 collision
 
-# Audience: 1 = the user wants to look (auto-open Chrome Canary), 0 = you (Claude)
-# will review the app yourself via the preview MCP tools — skip the open. See
-# "Who's looking: you vs. the user". Default to 1; set to 0 when you're the viewer.
-OPEN_BROWSER=${OPEN_BROWSER:-1}
+# --- launcher lives in the worktree root (one per worktree/branch), its own path inlined ---
+SCRIPT="$PWD/dev-portless.sh"
 
-# Open the URL in Chrome Canary once the dev server is actually serving
-# (backgrounded waiter, so it never races the boot). -k skips the portless
-# self-signed cert check. The portless proxy answers immediately — before
-# yarn dev is up — returning 502/404, so opening on mere reachability lands on
-# an error page. Loop until the proxy returns a real upstream response (2xx/3xx);
-# 502/503/504 = dev server not up yet, 404 = Vite booting, 000 = proxy not
-# reachable yet. Give up after ~120s so a crashed boot doesn't wait forever.
-# Skipped entirely when OPEN_BROWSER=0 (you're reviewing via your own tooling).
-[ "$OPEN_BROWSER" = "1" ] && \
-( for _ in $(seq 1 120); do \
-    code=$(curl -sko /dev/null -w '%{http_code}' "$PORTLESS_URL"); \
-    case "$code" in 2??|3??) open -a "Google Chrome Canary" "$PORTLESS_URL"; break ;; esac; \
-    sleep 1; \
-  done ) &
+# Always (re)generate so the inlined values track the current branch (one worktree = one branch,
+# but a branch switch would otherwise leave stale values baked in). It's generated infra — don't
+# hand-edit it; change the skill instead.
+{
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf '%s\n' "# dev-portless launcher (generated) — re-run with: bash $SCRIPT [--open]"
+    printf 'SELF=%q\n'          "$SCRIPT"          # this script's own pathname, inlined
+    printf 'APP_NAME=%q\n'      "$APP_NAME"
+    printf 'PORTLESS_URL=%q\n'  "$PORTLESS_URL"
+    printf 'WORKTREE=%q\n'      "$PWD"
+    printf 'MAIN_CHECKOUT=%q\n' "$MAIN_CHECKOUT"
+    printf 'DEVTOOLS_PORT=%q\n' "$DEVTOOLS_PORT"
+    cat <<'BODY'
 
-BETTER_AUTH_URL="$PORTLESS_URL" \
-BETTER_AUTH_TRUSTED_ORIGINS="$PORTLESS_URL" \
-DEVTOOLS_PORT="$DEVTOOLS_PORT" \
-portless "$APP_NAME" yarn dev
+cd "$WORKTREE"
+
+# yarn dev needs .env.local; worktrees don't inherit it from the main checkout
+test -f .env.local || cp "$MAIN_CHECKOUT/.env.local" .env.local
+
+# pick a FREE DevTools port — bump by 10; never kill a listener we didn't start
+while lsof -nP -iTCP:"$DEVTOOLS_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
+    DEVTOOLS_PORT=$((DEVTOOLS_PORT + 10))
+done
+
+# --open: once the dev server actually serves (2xx/3xx — not the bare proxy, which 502/404s during
+# boot), open Chrome Canary. Backgrounded waiter; gives up after ~120s so a crashed boot won't hang.
+if [ "${1:-}" = "--open" ]; then
+    ( for _ in $(seq 1 120); do
+        code=$(curl -sko /dev/null -w '%{http_code}' "$PORTLESS_URL" || true)
+        case "$code" in 2??|3??) open -a "Google Chrome Canary" "$PORTLESS_URL"; break ;; esac
+        sleep 1
+      done ) &
+fi
+
+exec env \
+    BETTER_AUTH_URL="$PORTLESS_URL" \
+    BETTER_AUTH_TRUSTED_ORIGINS="$PORTLESS_URL" \
+    DEVTOOLS_PORT="$DEVTOOLS_PORT" \
+    portless "$APP_NAME" yarn dev
+BODY
+} > "$SCRIPT"
+chmod +x "$SCRIPT"
+
+# Always keep it out of git via the repo-local exclude (never committed, no tracked .gitignore change).
+# In a worktree the exclude path resolves to the shared common git dir via --git-path.
+EXCLUDE=$(git rev-parse --git-path info/exclude); mkdir -p "$(dirname "$EXCLUDE")"
+grep -qxF 'dev-portless.sh' "$EXCLUDE" 2>/dev/null || echo 'dev-portless.sh' >> "$EXCLUDE"
+
+echo "launcher: $SCRIPT"
+echo "app: $APP_NAME   url: $PORTLESS_URL"
 ```
 
-Run it via `run_in_background: true` so the chat stays free for further work; the dev server stays up until the user stops it (or you call `TaskStop`). When `OPEN_BROWSER=1` (the default — the user is the viewer) the backgrounded waiter pops the app open in **Chrome Canary** once it's reachable. When you're reviewing the app yourself, run with `OPEN_BROWSER=0` and drive `$PORTLESS_URL` through your preview tooling instead — nothing opens on the user's screen.
+Then **run the launcher** via `run_in_background: true` (the chat stays free; the server runs until the user stops it or you `TaskStop`). Pass `--open` only when the **user** is the viewer; omit it when you're reviewing through your own tooling (see "Who's looking"):
+
+```bash
+bash "$SCRIPT"          # you (Claude) review via preview MCP / Claude-in-Chrome — nothing opens
+bash "$SCRIPT" --open   # the user wants to look — opens Chrome Canary once it's serving
+```
 
 App will be reachable at `https://<project>-<branch-slug>.localhost:1355` (e.g. `https://siegl-app-728-admin-filtration.localhost:1355`).
 
 ## Opening in Chrome Canary
 
-The recipe auto-opens the URL in Chrome Canary once the **dev server is actually serving** (a 2xx/3xx upstream response) **when `OPEN_BROWSER=1`** (the user is the viewer). It does *not* open on the portless proxy alone being reachable — the proxy answers before `yarn dev` is up and returns a 502/404, so opening then would land Canary on an error page. When you're reviewing the app yourself (`OPEN_BROWSER=0`) nothing opens — use the preview MCP tools against `$PORTLESS_URL` instead. To open (or re-open) it by hand — e.g. after a restart, or to hand the user a copy-pasteable command — use:
+With `--open`, the launcher opens the URL in Chrome Canary once the **dev server is actually serving** (a 2xx/3xx upstream response). It does *not* open on the portless proxy alone being reachable — the proxy answers before `yarn dev` is up and returns a 502/404, so opening then would land Canary on an error page. Without the flag (you're reviewing the app yourself) nothing opens — use the preview MCP tools against the URL instead. To open (or re-open) it by hand — e.g. after a restart, or to hand the user a copy-pasteable command — use:
 
 ```bash
 open -a "Google Chrome Canary" "https://<project>-<branch-slug>.localhost:1355"
