@@ -32,6 +32,16 @@ reads a skill's `description` to decide when it applies.
   local-time review sessions, event counts, and approve/changes-requested
   verdicts. Defaults to last week; resolves the repo from the current project, so
   it works in any project without editing.
+- **[pr-status](pr-status/SKILL.md)** — Show the PRs you authored with their
+  review status: the review decision, who's requested to review, each human
+  reviewer's latest verdict, draft state, and whether a changes-requested PR is
+  still awaiting re-review. Defaults to your open PRs in the current repo.
+- **[review-queue](review-queue/SKILL.md)** — The reviewer's-eye counterpart to
+  `pr-status`: list open PRs that are awaiting your review or that you could pick
+  up, each with its bound issue, your latest review state, and a verdict of
+  whether it's waiting on you or the author. Optionally queues `/parallel-review`
+  tasks for PRs you haven't reviewed yet. Resolves your login and the repo
+  automatically, so it works in any project.
 
 ## Install
 
