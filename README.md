@@ -12,6 +12,12 @@ reads a skill's `description` to decide when it applies.
   including the settings and failure workarounds (architecture flags,
   `--concurrent-jobs 1`, the `upload-artifact@v4` `mime_type` breakage) that make
   it actually work.
+- **[ai-docs-from-reviews](ai-docs-from-reviews/SKILL.md)** — Scan recent PRs and
+  the comments reviewers left on them, distil the recurring issues into rules, and
+  fold the genuinely-missing ones into the repo's AI-docs file (AGENTS.md /
+  CLAUDE.md) so they stop recurring. The key judgment is separating "already
+  covered but still violated" from "genuinely missing" — only the latter become
+  new rules. Read-only on GitHub; explicit `/ai-docs-from-reviews` invocation only.
 - **[dev-portless](dev-portless/SKILL.md)** — Start a project's dev server
   behind [portless](https://www.npmjs.com/package/portless) at a stable
   `<project>-<suffix>.localhost` URL. Handles per-worktree `.env.local`, isolated
