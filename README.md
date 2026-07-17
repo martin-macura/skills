@@ -23,6 +23,13 @@ reads a skill's `description` to decide when it applies.
   `<project>-<suffix>.localhost` URL. Handles per-worktree `.env.local`, isolated
   TanStack DevTools ports, and the better-auth origin env vars. The project name
   is derived from the git repo, so it works in any project without editing.
+- **[figma-pixel-perfect](figma-pixel-perfect/SKILL.md)** — Implement a Figma
+  frame/node pixel-perfectly and prove it: extract the node's raster, metadata,
+  and generated code via the Figma MCP, translate every raw px/hex through the
+  project's tokens and spacing scale, pin mock data to the design's exact
+  values, then converge with an injected difference overlay, pixelmatch, and
+  computed-style audits. Ground truth is the Figma raster; generated code is
+  only ever a draft.
 - **[issue-worklog](issue-worklog/SKILL.md)** — Summarize the GitHub issues you
   worked on in a repo over a time window — each issue's branch/PR with the
   per-day commit time ranges, in local time, plus a done/in-flight status.
