@@ -37,7 +37,7 @@ reads a skill's `description` to decide when it applies.
   in any project without editing.
 - **[parallel-review](parallel-review/SKILL.md)** — Run four independent,
   context-free review subagents in parallel on a PR (or the working diff), one
-  lens each and a mix of models, each free to delegate to at most two helpers
+  lens each and a mix of models, each free to delegate to helpers of its own
   that may not delegate further; then aggregate and triage the combined findings
   into actionable / nits / ambiguous. One pass, no loop. Only applies fixes when
   you authored the PR or explicitly asked for edits; on someone else's PR it
