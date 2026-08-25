@@ -35,11 +35,13 @@ reads a skill's `description` to decide when it applies.
   per-day commit time ranges, in local time, plus a done/in-flight status.
   Defaults to last week; resolves the repo from the current project, so it works
   in any project without editing.
-- **[parallel-review](parallel-review/SKILL.md)** — Run three independent,
-  context-free `/review` subagents in parallel on a PR (or the working diff),
-  then aggregate the combined findings. Only applies fixes when you authored the
-  PR or explicitly asked for edits; on someone else's PR it reports findings and
-  drafts suggestions instead.
+- **[parallel-review](parallel-review/SKILL.md)** — Run four independent,
+  context-free review subagents in parallel on a PR (or the working diff), one
+  lens each and a mix of models, each free to delegate to at most two helpers
+  that may not delegate further; then aggregate and triage the combined findings
+  into actionable / nits / ambiguous. One pass, no loop. Only applies fixes when
+  you authored the PR or explicitly asked for edits; on someone else's PR it
+  reports findings and drafts suggestions instead.
 - **[pr-review-log](pr-review-log/SKILL.md)** — Summarize the GitHub PR reviews
   you submitted on a repo over a time window, grouped by PR with issue numbers,
   local-time review sessions, event counts, and approve/changes-requested

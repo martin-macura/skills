@@ -1,18 +1,18 @@
 ---
 name: parallel-review
 disable-model-invocation: true
-description: Run FOUR independent code-review subagents in parallel — each given the same blank view of the change but a different lens (correctness, martin-reviewer, simplify, MVP parity) and a mix of models — then triage the combined findings into actionable / nits / ambiguous, fix the first two on the user's own code, and **repeat the whole round up to three times, until one turns up nothing new** (review → fix → review on the user's own code; on someone else's PR the same three rounds run report-only, each a fresh independent sample of the unchanged diff); whatever stays ambiguous goes into a `/review-cockpit` for the user's call. Use after creating a PR, after a larger set of changes (e.g. addressing review feedback or resolving a merge), or whenever the user asks for a thorough / multi-agent review, a "triple review", "review with subagents", or to double-check a change before merge. Invoke only via the explicit `/parallel-review` command — model auto-invocation is disabled so a spawned subagent cannot recursively trigger another panel.
+description: Run FOUR independent code-review subagents in parallel — each given the same blank view of the change but a different lens (correctness, martin-reviewer, simplify, MVP parity) and a mix of models, and each free to delegate to at most TWO helpers of its own that may not delegate further — then triage the combined findings into actionable / nits / ambiguous, fix the first two on the user's own code (report-only on someone else's PR), and put whatever stays ambiguous into a `/review-cockpit` for the user's call. **One pass, no loop.** Use after creating a PR, after a larger set of changes (e.g. addressing review feedback or resolving a merge), or whenever the user asks for a thorough / multi-agent review, a "triple review", "review with subagents", or to double-check a change before merge. Invoke only via the explicit `/parallel-review` command — model auto-invocation is disabled so a spawned subagent cannot recursively trigger another panel.
 ---
 
 # Parallel review (four fresh subagents, four lenses)
 
-Spawn **four separate, fresh subagents** on the same diff, run them **in parallel**, then triage and act on the combined findings.
+Spawn **four separate, fresh subagents** on the same diff, run them **in parallel**, then triage and act on the combined findings. **One pass — there is no loop.**
 
 Three properties do the work, and they are not the same thing:
 
 - **Blank context about the change.** No "what this PR does" paragraph, no output-format instructions, and above all none of your conclusions. Reviewers that know nothing beyond the diff catch what the author rationalizes away.
 - **Different lenses and different models.** Four identical clones pay for the same blind spot four times. Each reviewer gets exactly one lens paragraph and the panel spans more than one model, so their misses don't line up.
-- **Repetition until it comes up empty.** One panel is a sample, not a verdict. Fixing a finding changes the diff, and the next panel reviews the fix too — which is where a fix's own regression, and the second-order finding the first round's noise hid, actually show up. The default is a **loop**: review → triage → fix → review again, stopping when a round produces nothing new. That holds even where nothing is fixed: on someone else's PR the bytes don't change, and the later rounds buy a **fresh independent sample** of them — twelve reviewers over one diff instead of four, which is where the long tail the first panel happened to miss turns up. Three rounds either way; whose code it is decides what a round *does* with its findings, not how many rounds there are.
+- **A bounded fan-out instead of a second round.** One panel is a sample, not a verdict — and the answer to that is depth inside the round, not repeating the round. A reviewer may hand **at most two** helpers a slice of its own lens: half a large diff, or one claim that needs checking against the code. Helpers never spawn helpers and the panel never runs twice, so the worst case is twelve agents one level deep, once. Both halves of that bound are scars: the old three-round loop mostly re-raised the first round's cards at three times the spend, and an *unbounded* fan-out deadlocked this panel at ~30 nested agents.
 
 A lens is an instruction about *how to look*, never information about the change. Keep that line clean and the first two properties hold at once.
 
@@ -26,23 +26,27 @@ Skip for trivial one-line changes.
 
 ## How to run
 
-**Steps 1–3 run once per invocation. Steps 4–7 are one round, and the default is to repeat them** — [The loop](#the-loop) below says how many times and when to stop.
+**All seven steps run exactly once.** There is no second round; [The fan-out budget](#the-fan-out-budget) below says where the extra agents go instead, and what this skill may and may not spawn.
 
-1. **Bail if a review is already in progress.** Before anything else, call `TaskList` and check whether a parallel-review is already running — an `in_progress` task whose subject starts `parallel-review:` (the lock below), or in-progress review subagents from a prior invocation. If one is active, **stop**: tell the user a review is already in progress and do **not** spawn a second panel — a duplicate concurrent panel wastes tokens and muddles aggregation. To make this detectable across background / automation / `/loop` / `review-queue` runs (where the panel doesn't block a turn), register a lock: `TaskCreate` a `parallel-review: <target>` task, set it `in_progress` before the first round's panel, and `TaskUpdate` it to `completed` only when the **loop** ends — one lock for the whole run, never one per round (release it even if the review errors).
+1. **Bail if a review is already in progress.** Before anything else, call `TaskList` and check whether a parallel-review is already running — an `in_progress` task whose subject starts `parallel-review:` (the lock below), or in-progress review subagents from a prior invocation. If one is active, **stop**: tell the user a review is already in progress and do **not** spawn a second panel — a duplicate concurrent panel wastes tokens and muddles aggregation. To make this detectable across background / automation / `/loop` / `review-queue` runs (where the panel doesn't block a turn), register a lock: `TaskCreate` a `parallel-review: <target>` task, set it `in_progress` before spawning the panel, and `TaskUpdate` it to `completed` when the review ends — one lock for the whole run (release it even if the review errors).
 2. **Resolve the target.** Pick the command by what exists — don't push or open a PR just to get a number; review the diff in place:
    - **A PR exists** (`gh pr view --json number` read-only finds one) → `/review PR <n>`.
    - **No PR** — a branch committed ahead of `main` but not yet pushed/opened, *or* uncommitted working-tree changes → `/code-review`. In this setup `/review` alone is GitHub-PR-only; `/code-review` is the working-diff reviewer and resolves the diff itself (committed branch changes vs the base, i.e. `git diff origin/main...HEAD`, plus any unstaged edits). A clean tree with no branch commits ahead of `main` means there's nothing to review — say so instead of spawning a panel.
-3. **Resolve authorship now, not later.** `gh pr view <n> --json author` (read-only). The user is GitHub `2bad2furious`. **Own code** = the user authored the PR, *or* the user explicitly asked for fixes, *or* it's a no-PR diff (a local branch or working tree — always theirs). Everything downstream — whether findings get fixed or only reported — branches on this one answer, so settle it before the panel lands. What it does **not** decide is how many rounds run: **three either way**. It decides what a round *does* — on own code a round fixes, and the next panel reviews the fix too; on someone else's the diff stays put, and the next panel is a fresh independent sample of it. Both are worth three rounds; see [The loop](#the-loop).
-4. **Spawn four `general-purpose` Agent calls in a single message** so they run concurrently. Each agent's prompt is assembled from exactly three parts, in this order, and nothing else — **in every round**, including the later ones. Round 2's agents are as blank as round 1's: they are never told what an earlier round found or that anything was fixed.
+3. **Resolve authorship now, not later.** `gh pr view <n> --json author` (read-only). The user is GitHub `2bad2furious`. **Own code** = the user authored the PR, *or* the user explicitly asked for fixes, *or* it's a no-PR diff (a local branch or working tree — always theirs). Everything downstream — whether findings get fixed or only reported — branches on this one answer, so settle it before the panel lands. It decides only that: on own code the surviving findings get fixed, on someone else's they are reported and nothing is touched. The panel itself is identical either way, and runs once either way.
+4. **Spawn four `general-purpose` Agent calls in a single message** so they run concurrently. Each agent's prompt is assembled from exactly three parts, in this order, and nothing else.
 
    **(a) The command** resolved in step 2 — `/review PR <n>` or `/code-review`.
 
    **(b) The guard block, verbatim, identical for all four:**
    > Be **extra critical** — flag every potential issue you see, no matter how minor. When in doubt, report it.
    >
-   > Review this change YOURSELF in this single context. Do **NOT** spawn subagents, do **NOT** use the Agent/Task tools, and do **NOT** invoke `/parallel-review` or any multi-agent / parallel / "ultra" review mode — if a skill offers a fan-out path, decline it and review directly. Treat the Agent tool as if it were absent from your tool set: *if the Agent tool is not available in your current tool set, do not error — perform each angle (and each verification) yourself, sequentially, in this context.* Report only; do not edit files, commit, or run any write command.
+   > You own this review. You may delegate to **at most 2 sub-agents**, spawned in a **single** message, and only to split the work: half the diff each, or one helper checking a single claim against the code while you keep reading. Two is a ceiling, not a quota — spawning none and doing it all yourself is a good outcome. Never delegate the review as a whole, and never spawn a third.
+   >
+   > **Anything you spawn is a leaf.** Put this in every sub-agent's prompt, verbatim: *"Do NOT spawn subagents, do NOT use the Agent/Task tools, and do NOT invoke `/parallel-review`, `/code-review`'s multi-angle fan-out, or any other multi-agent / parallel / 'ultra' review mode — if a skill offers a fan-out path, decline it and do the work directly. Treat the Agent tool as if it were absent from your tool set: if the Agent tool is not available in your current tool set, do not error — perform each angle, and each verification, yourself, sequentially, in this context. Report only; do not edit files, commit, or run any write command."*
+   >
+   > The same ceiling binds you: do **NOT** invoke `/parallel-review` or any "ultra" review mode, and where a skill orders a wider fan-out — `/code-review` asks for ~10 angles via the Agent tool — **decline that fan-out**: fold the angles into your 2 sub-agents, or walk them yourself, sequentially, in this context. Report only; do not edit files, commit, or run any write command.
 
-   The escape-hatch sentence is load-bearing. `/code-review` itself orders a fan-out into ~10 angles via the Agent tool and its instructions outrank a bare "don't spawn subagents" — that produced ~30 nested agents that deadlocked the whole panel on the 600 s stream watchdog. You can spot it in a report by agents you never launched (`Angle A`, `Angle B`, `Angle Reuse`…).
+   Both halves of that — the hard 2 and the leaf rule — are load-bearing, and they are one lesson from two directions. `/code-review` orders a fan-out into ~10 angles and its instructions outrank a vague "keep it small"; unbounded, that produced ~30 nested agents which deadlocked the whole panel on the 600 s stream watchdog. You can spot it in a report by agents nobody launched from here (`Angle A`, `Angle B`, `Angle Reuse`…). Bounded at 4 reviewers × 2 leaves it is 12 concurrent agents and one level of nesting, which finishes. The escape-hatch sentence stays in the leaf prompt for the same reason it always did: without it, an agent that reads "no Agent tool" as an error condition stalls instead of reviewing.
 
    **(c) One lens paragraph**, different per agent:
 
@@ -54,86 +58,45 @@ Skip for trivial one-line changes.
    | `review:mvp-parity` | opus | Lens: **parity with the legacy MVP**, which is the default answer for any ambiguous business rule. Its source is at `~/projects/softero-cz/mvp` (`logistics-backend`, `logistics-frontend`) — read the code there; a running instance exists only under docker. For every behaviour this diff adds or changes, find the MVP's equivalent and say whether the new behaviour matches, deliberately diverges, or silently drifts. Quote the MVP file:line you compared against. "No MVP equivalent exists" is a valid and useful finding. Divergence is not automatically a bug — an unacknowledged one is. |
 
    Set the model via the Agent call's `model` option. Use each agent's label as its `label`.
-5. **Mechanical sweep (orchestrator-side, while the panel runs).** The four reviewers stay blank — this deterministic layer is yours. Run the greps and checklist in "Mechanical sweep + recurring-classes checklist" below over the diff. **Re-run it every round in which the diff changed** — after a fix round it contains your own edits, and this is the cheapest check there is on them. On someone else's PR the bytes are identical from round to round, so it runs **once**, in round 1: deterministic greps over unchanged input can only return the same answer.
-6. **Aggregate, verify, triage.** Merge and dedupe across the four and fold in the mechanical sweep — a finding raised by **any one** counts, and one raised by several keeps its `agents` list (the cockpit renders it as a "N× nezávisle" badge). From round 2 on, dedupe **against the ledger of every earlier round** as well, so only what is new to the *run* reaches triage. Then run "Verification before triage" and "Triage" below.
+5. **Mechanical sweep (orchestrator-side, while the panel runs).** The four reviewers stay blank — this deterministic layer is yours. Run the greps and checklist in "Mechanical sweep + recurring-classes checklist" below over the diff. It runs **once**, over the diff the panel is reviewing. One exception, on own code: after your own fix commit lands, re-run the greps over it. No panel ever sees your edits — this deterministic pass is the only check they get, and it costs a few seconds.
+6. **Aggregate, verify, triage.** Merge and dedupe across the four and fold in the mechanical sweep — a finding raised by **any one** counts, and one raised by several keeps its `agents` list (the cockpit renders it as a "N× nezávisle" badge). **A reviewer's own helpers are not independent voices** — everything under one lens arrives as that reviewer's single report and counts once, whoever inside it actually found it. A lens that split its diff in half and reported the same thing from both halves is 1×, not 2×; inflating that badge is how one agent's opinion starts reading like a consensus. Then run "Verification before triage" and "Triage" below.
 7. **Act on the triage.** Own code: fix `actionable` + `nits`, archive them with how they were fixed, and put only `ambiguous` in front of the user. Someone else's: fix nothing, report everything. Go to "Acting on the triage".
-8. **Decide whether to run another round.** The round moved something — a fix landed (own code), or a finding new to the ledger surfaced (someone else's) — the cap is not reached and no stop condition fired → say so in chat and go back to step 4 with a fresh panel. Otherwise stop and hand over. The conditions are in [The loop](#the-loop).
 
-## The loop
+## The fan-out budget
 
-**Three rounds, hard cap.** Not "about three", not "until it feels clean" — the third round's fixes
-ship unreviewed by this panel, and that is the accepted price of a loop that terminates. A lower cap
-is fine (`/parallel-review 1`, or the user saying "jednou" / "bez smyčky", runs a single round); a
-higher one is not, whatever the panel is still finding. If round 3 still turns up actionable
-findings, that is a signal to report — *"kolo 3 pořád našlo 2 věci, strop je 3, tady jsou"* — not a
-reason to keep going.
+**Four reviewers, at most two helpers each, one level deep, one pass.** That is the entire agent
+budget, and no branch of this skill exceeds it:
 
-Every round is steps 4–7: a fresh four-lens panel on the current diff, the mechanical sweep,
-verification, triage, and — on the user's own code — the fixes. **Stop as soon as any of these is true:**
+- **2 sub-agents per reviewer, hard.** Spawned by the reviewer, in one message, out of its own lens.
+  A reviewer that needs none spawns none — a single lens over a 200-line diff has nothing to split.
+- **Helpers are leaves.** A sub-agent that spawns anything is the failure this cap exists to prevent.
+  The guard block carries the verbatim no-fan-out paragraph the reviewer must pass down; that
+  paragraph is the mechanism, not a formality.
+- **Split the input, not the review.** The two shapes that pay: *half the diff each* (a big change,
+  the same lens over both halves) and *one helper verifying one claim* — an MVP comparison, a "is
+  this really removed" check — while the reviewer keeps reading. Two helpers re-running the same lens
+  over the same files is three agents doing one agent's work.
+- **Helpers stay blank too.** They get the lens and their slice, never "what this PR does" and never
+  what the reviewer already suspects. It is the panel's own property, one level down.
+- **One report per reviewer.** The reviewer folds its helpers' findings into its own report. You
+  aggregate four reports, not twelve — see step 6 on why they still count as four voices.
 
-- **The round produced nothing new to the ledger.** This is the intended exit, and what counts as
-  "nothing" depends on whose code it is. On the user's own code it is **no new `actionable` and no
-  new `nits`**: leftover `ambiguous` findings do **not** keep the loop alive — they are the user's
-  pass, not work, and a loop that waited for them would never end. On someone else's PR every bucket
-  is a deliverable, `ambiguous` included, so there it is **no new finding in any bucket**.
-- **Three rounds are done.** Say the loop hit the cap rather than letting it read as convergence.
-- **Nothing was actually fixed this round — own code only.** If every finding turned out to be a
-  no-op, a duplicate or wrong on verification, the diff has not changed and the next panel would
-  review the same bytes. This is **not** a stop condition on someone else's PR: there the diff never
-  changes by design, and re-reading the same bytes with a fresh blank panel is the entire point of
-  the round.
-- **The panel is oscillating — own code only.** A finding that asks you to undo a previous round's
-  fix is not `actionable`; it is `ambiguous`, it goes to the user with both sides stated, and it ends
-  the loop. Two rounds arguing with each other is the failure mode this cap exists to bound. On a
-  report-only run there is no fix to undo, so two reviewers contradicting each other is just an
-  `ambiguous` card and the loop carries on.
+**There is no loop.** One panel, one triage, one set of fixes, hand over. If the user wants another
+sample after a big fix round they say so, and running `/parallel-review` again — a fresh blank panel
+on the new diff — is a perfectly good answer. It is never automatic, never scheduled by this skill,
+and never announced as "kolo 2" on your own initiative.
 
-**The ledger is orchestrator-side and lives across the whole run.** Keep every finding you have
-already seen — fixed, archived, dropped by the user, or judged wrong on verification — keyed by file
-+ anchor + the claim itself, and match each round's output against it before triaging. Three things
-follow:
+Say the honest version of what that buys: **one sample of the diff, not a verdict**. Sampling three
+times used to be the default and is not any more — most of what the later rounds reported was the
+first round's cards again, and the genuinely new ones did not pay for two more panels plus the ledger
+bookkeeping needed to dedupe them. So the summary says *"jeden průchod, čtyři recenzenti"*, never
+anything that implies the change was swept until clean.
 
-- **"New" means new to the ledger**, not new to the round. A finding four reviewers raise again in
-  round 2 because it is still visible in the diff is not new — it is round 1's card, already
-  answered.
-- **A finding the user dropped is never re-raised** — not as a card, not in the summary, not as a
-  follow-up task, and not in a later round either. Archived is archived for the rest of the run.
-- **A regression introduced by one of your fixes is genuinely new**, and catching it is the entire
-  reason the loop exists. Don't let the dedupe swallow it because it names a file that already
-  appeared in an earlier round.
+### Someone else's PR: the same single pass, report-only
 
-**The ledger never enters a reviewer's prompt.** It is how *you* read their output. Handing round 2
-"we already fixed X, don't report it again" trades the blank-context property for a small dedupe
-saving — and blank context is the whole point of the panel. The dedupe is yours to do, after they
-answer.
-
-**Say the round count out loud as you go**, before each new panel and in the final summary. Three
-rounds of four agents is twelve reviewer runs plus the fixing, which is deliberate — PostHog's
-version of this budget is *"something like 60% of my token spend is burned automating the toil of
-handling CI and review and I don't regret a single dollar"* — but the user gets to call it off, and
-they can only do that if they can see it running. When a further round is triggered by a single nit
-fix, say that too; they may prefer to stop there.
-
-### Someone else's PR: the same three rounds, report-only
-
-Nothing is fixed, nothing is committed, no branch is touched — and the loop runs anyway. Rounds 2 and
-3 are pure sampling, and that is worth paying for: twelve reviewers over one diff instead of four,
-each blind to what the others found. What changes versus an own-code loop:
-
-- **The panel prompt is identical every round** — same four lenses, same models, still blank. That
-  means the draws are correlated and the yield falls off round by round; that is the honest cost of
-  sampling an unchanged diff, not a reason to leak the ledger into round 2's prompt to "make it look
-  somewhere else".
-- **The mechanical sweep runs once**, in round 1 (step 5).
-- **Report the yield, not the raw count, before each new panel** — *"kolo 2: 3 nové nálezy z 11
-  nahlášených"*, *"kolo 3: 1 nový"*. On an unchanged diff most of what a later round says is round
-  1's cards again, and the user decides whether the next four runs are worth it. They can only do
-  that if they see the new-to-ledger number.
-- **One cockpit across the whole loop**, everything still live, each card carrying the round it came
-  from. A finding the user drops mid-run is `archived: true` and never re-raised in a later round —
-  that is the one thing that gets archived here, since nothing is being fixed.
-- **Hand over the drafted `gh` commands once, after the last round.** A reply set drafted after round
-  1 is missing two thirds of the review.
+Nothing changes about the panel. Nothing is fixed, nothing committed, no branch touched, and every
+bucket — `ambiguous` included — is a deliverable, so it all goes into one cockpit live. Hand over the
+drafted `gh` commands once, at the end.
 
 ## Mechanical sweep + recurring-classes checklist
 
@@ -191,14 +154,14 @@ Every surviving finding lands in exactly one bucket:
    - a `change` block (`before` at the base sha, `after` at head) wherever the fix is a code edit, so Historie shows the actual before/after.
    - the `agents` list intact, so a finding four reviewers independently raised still reads that way.
 3. **Only `ambiguous` stays live** in the Nálezy tab, each with its snippet, its MVP comparison, and the options — that is what the user's pass is for. Keep the card honest: state the choice, not your preference dressed as a finding.
-4. **One commit per round** (GitMoji + `Relates: #<issue>`), summarising per-finding what changed — not one commit for the whole loop, so each round's cockpit `change` block has a real before/after pair of shas. Push is the user's — the hook blocks it.
-5. **Leave E2E and the signoff for the last round.** The signoff status is bound to the head SHA, so every further fix commit invalidates it; running the suite after round 1 of 3 buys a signoff that is dead by the time the loop ends.
+4. **Commit the fixes** (GitMoji + `Relates: #<issue>`), summarising per-finding what changed, so every cockpit `change` block has a real before/after pair of shas. One commit is usually right; split it where the fixes are genuinely separate atomic changes, per the repo's commit rule. Push is the user's — the hook blocks it.
+5. **E2E and the signoff go last**, after the final fix commit. The signoff status is bound to the head SHA, so any commit after it — yours, or the user's reaction pass — invalidates it; running the suite while you are still editing buys a signoff that is already dead.
 
 ### Someone else's PR
 
 **Edit nothing** — no commits, no merges, no branch checkouts that mutate state. Triage still runs, but every bucket goes into the cockpit as a live finding (nothing archived, nothing fixed), with drafted patches/commands the user or the author can apply. Posting to GitHub is a separate explicit step and follows `review-feedback` Step 5 for the mechanics; this repo forbids agent GitHub writes, so hand over the `gh` commands.
 
-**The loop still runs — three rounds**, each a fresh blank panel on the same unchanged diff, each round's new findings appended to the same cockpit and marked with their round. See ["Someone else's PR: the same three rounds, report-only"](#someone-elses-pr-the-same-three-rounds-report-only) for what differs from a fixing loop.
+**The panel runs once**, its findings land in one cockpit, and nothing is re-sampled. See ["Someone else's PR: the same single pass, report-only"](#someone-elses-pr-the-same-single-pass-report-only) above.
 
 ### Building the cockpit
 
@@ -206,7 +169,7 @@ Invoke **`/review-cockpit`** — it is the surface for this, and it takes the fi
 
 Spawn the panel *first* and build the walkthrough while it runs, with `review.status: "running"` and one `agents` entry per reviewer; the page fills itself in when the findings land. Never make the user wait for the panel before showing them anything.
 
-**One cockpit for the whole loop, rebuilt each round** — same id, so the open page updates itself and anything the user typed survives. Set `review.status` back to `"running"` when a new round starts, with a `label` that names it (`"Kolo 2 běží — 4 recenzenti"`) and the round in each agent's name, or a page that already looks finished will hide the fact that the loop is still going. Historie accumulates across rounds; a card carries the round it came from, so "nalezeno až ve 2. kole, po opravě prvního" stays visible.
+**One cockpit for the run**, with a stable id across every rebuild, so the open page updates itself and anything the user typed survives. You rebuild it at least twice — once when the findings land (`review.status` from `"running"` to done) and again when your fixes archive their cards into Historie — and once more per reaction pass. Those are reaction round-trips, not review rounds: the panel does not run again.
 
 When their reactions come back: apply each literally, **BEZ REAKCE means not approved**, and a dropped finding is archived (`archived: true`), never deleted and never re-raised in the summary or as a follow-up task.
 
@@ -227,16 +190,18 @@ If you only managed to run one agent (or claimed four but ran two), say so and r
 
 Report the triage counts as they actually fell (`n actionable fixed, n nits fixed, n ambiguous for you`), and never file something as a nit because fixing it silently is easier than asking.
 
-Same for the loop: report **how many rounds actually ran and why it stopped** — a round that came up empty and a round that hit the three-round cap are opposite outcomes and must never be reported with the same sentence. One round because the panel converged is a good result; one round because you decided to skip the loop is a shortcut, and the user needs to know which they got.
+Same for the fan-out: a reviewer's helpers belong to that reviewer's run and are not extra
+reviewers. "Dvanáct agentů" for a four-lens panel where each lens split its diff in half is
+inflation — report the four lenses, and mention the helpers only where how the work was split
+actually matters.
 
-On a report-only run the same honesty applies to the **yield**: report how many of each round's
-findings were *new to the ledger*, never how many it raised. Twelve reviewers re-raising round 1's
-four findings is one review, not three, and "11 nálezů ve 3 kolech" when four of them are distinct is
-the report-only version of claiming a four-agent panel you ran twice.
+And say the shape out loud: **one pass, no loop.** Never let a summary imply the diff was swept
+repeatedly, and never quietly run a second panel and fold it into the same report. A panel that
+converged on little means this one sample found little — not that the change is clean.
 
 ## Notes
 
-- This operationalizes the `review-after-pr` memory, extended with the lens/model diversity, the actionable/nit/ambiguous triage and the outer loop from PostHog's "Stop being the code review bottleneck" (2026-08) — their `qa-swarm` + `review-triage` "iterates up to three times or until no new actionable threads appear", which is where the three-round cap comes from. Related habits: verify behavioral/business-rule claims against the source of truth (the MVP) rather than guessing; browser-verify UI behavior where relevant.
-- **Where this deliberately differs from their swarm.** Theirs is unattended and closes the loop on GitHub: findings are fixed *and pushed*, nits are auto-replied on the thread, a companion agent auto-approves low-risk PRs. Ours stops at the commit — pushes are hook-blocked, agent GitHub writes are forbidden by the repo, and the loop's whole output for anything requiring an opinion is a cockpit card. Ours also has two layers theirs doesn't name: the **MVP as a domain oracle** (the legacy app is the default answer for any ambiguous business rule, and every behavioural finding is checked against it before triage) and the **orchestrator-side mechanical sweep**, which is deterministic rather than a fifth agent. And where their `qa-team` deliberately fans out into nested subagents, ours forbids it — that shape deadlocked this panel at ~30 agents on the 600 s stream watchdog, which is what the guard block exists for. No security lens here either; it was dropped as not worth a slot on this codebase.
+- This operationalizes the `review-after-pr` memory, extended with the lens/model diversity and the actionable/nit/ambiguous triage from PostHog's "Stop being the code review bottleneck" (2026-08). Their `qa-swarm` + `review-triage` also "iterates up to three times or until no new actionable threads appear" — **we deliberately don't** (since 2026-08-25). That loop shipped here, and the later rounds mostly re-raised the first one's cards; the budget moved into a bounded one-level fan-out inside the single round instead. Related habits: verify behavioral/business-rule claims against the source of truth (the MVP) rather than guessing; browser-verify UI behavior where relevant.
+- **Where this deliberately differs from their swarm.** Theirs is unattended and closes the loop on GitHub: findings are fixed *and pushed*, nits are auto-replied on the thread, a companion agent auto-approves low-risk PRs. Ours stops at the commit — pushes are hook-blocked, agent GitHub writes are forbidden by the repo, and the panel's whole output for anything requiring an opinion is a cockpit card. Ours also has two layers theirs doesn't name: the **MVP as a domain oracle** (the legacy app is the default answer for any ambiguous business rule, and every behavioural finding is checked against it before triage) and the **orchestrator-side mechanical sweep**, which is deterministic rather than a fifth agent. And where their `qa-team` fans out into nested subagents unbounded, ours allows exactly two leaves per reviewer and no second level — unbounded, that shape deadlocked this panel at ~30 agents on the 600 s stream watchdog, which is what the guard block exists for. No security lens here either; it was dropped as not worth a slot on this codebase.
 - **Browser-verifying a modifier click:** Playwright's `mouse.click(x, y, { modifiers: ['Meta'] })` did **not** set `metaKey` on the DOM event in a real run — the guard under test saw a plain click and the result looked like the opposite of the truth. Hold the key instead (`keyboard.down('Meta')` → `mouse.click()` → `keyboard.up('Meta')`) and **assert the modifier arrived** (record `e.metaKey` from a capture-phase listener) before believing any modifier-click result. Note also that on macOS `Ctrl`+click is a context-menu gesture, so no `click` event fires at all.
 - Posting the findings as PR comments is a separate, explicit step — only do GitHub writes when the user/project allows it; otherwise hand the user the reply commands.
