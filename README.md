@@ -57,6 +57,12 @@ reads a skill's `description` to decide when it applies.
   whether it's waiting on you or the author. Optionally queues `/parallel-review`
   tasks for PRs you haven't reviewed yet. Resolves your login and the repo
   automatically, so it works in any project.
+- **[throttled-run](throttled-run/SKILL.md)** — `throttled <command>` runs a
+  heavy job (build, suite, e2e, migration) only once the machine's load average
+  is under a ceiling; while it isn't, it prints why and retries instead of
+  piling a third suite onto a box that is already thrashing. Ships the
+  `throttled` script itself — pure bash 3.2 + awk, macOS and Linux, `exec`s the
+  command so exit code and streams pass through untouched.
 
 ## Install
 
