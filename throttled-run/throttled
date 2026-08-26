@@ -10,7 +10,7 @@
 set -u
 set -o pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 PROG=${0##*/}
 
 SLEEP_PID=
@@ -36,10 +36,13 @@ EX_TEMPFAIL=75
 
 PER_CPU=${THROTTLED_PER_CPU:-1.0}
 MAX_LOAD=${THROTTLED_MAX_LOAD:-}
-INTERVAL_SPEC=${THROTTLED_INTERVAL:-30s}
+INTERVAL_SPEC=${THROTTLED_INTERVAL:-2s}
+REPORT_SPEC=${THROTTLED_REPORT:-30s}
 MAX_WAIT_SPEC=${THROTTLED_MAX_WAIT:-}
 METRIC=${THROTTLED_METRIC:-1}
+MIN_IDLE=${THROTTLED_MIN_IDLE:-60}
 MIN_FREE_MEM=${THROTTLED_MIN_FREE_MEM:-10}
+IDLE_RESCUE=1
 CHECK_MEM=1
 JITTER=1
 QUIET=${THROTTLED_QUIET:-0}
@@ -54,19 +57,31 @@ USAGE
     $PROG [options] [--] <command> [args...]
     $PROG --check [options]
 
-The load gate compares the ${METRIC}-minute load average against a ceiling. While the
-machine is over it, $PROG prints why and sleeps, then re-checks. Once the gate
-passes it execs the command, so exit code, signals and streams pass straight
-through. Its own chatter goes to stderr; the command owns stdout.
+The gate compares the ${METRIC}-minute load average against a ceiling. While the
+machine is over it, $PROG prints why and re-checks every $INTERVAL_SPEC, until the gate
+opens or --max-wait runs out. Then it execs the command, so exit code, signals
+and streams pass straight through. Its own chatter goes to stderr; the command
+owns stdout.
+
+The load average decays with a one-minute time constant, so it stays high for a
+while after the machine is already free. When it is over the ceiling, $PROG
+samples instantaneous CPU idle and starts anyway if the box is genuinely idle
+($MIN_IDLE% by default) instead of waiting out the decay. --no-idle-rescue turns
+that off.
 
 OPTIONS
     -p, --per-cpu F      ceiling as load-per-CPU (default $PER_CPU, so F x ncpu)
     -l, --max-load N     absolute load ceiling; overrides --per-cpu
     -m, --metric 1|5|15  which load average to gate on (default $METRIC)
-    -i, --interval SPEC  how long to wait between checks (default $INTERVAL_SPEC)
+    -i, --interval SPEC  how often to re-check (default $INTERVAL_SPEC — reading the load
+                         is free, so this is start latency, not cost)
+    -r, --report SPEC    how often to print while waiting (default $REPORT_SPEC; the
+                         first line and the verdict always print)
     -w, --max-wait SPEC  give up after this long (default: wait forever)
         --then run|fail  what --max-wait does when it expires (default $ON_TIMEOUT)
     -n, --nice N         run the command under nice -n N once the gate passes
+        --min-idle P     CPU idle % that overrides a decaying load (default $MIN_IDLE)
+        --no-idle-rescue gate on the load average alone
         --min-free-mem P Linux: also require P% MemAvailable (default $MIN_FREE_MEM)
         --no-mem         skip the memory gate
         --no-jitter      don't randomise the sleep (jitter decorrelates waiters)
@@ -84,12 +99,13 @@ EXIT CODES
 
 ENVIRONMENT
     THROTTLED_PER_CPU, THROTTLED_MAX_LOAD, THROTTLED_METRIC, THROTTLED_INTERVAL,
-    THROTTLED_MAX_WAIT, THROTTLED_MIN_FREE_MEM, THROTTLED_QUIET
+    THROTTLED_REPORT, THROTTLED_MAX_WAIT, THROTTLED_MIN_IDLE,
+    THROTTLED_MIN_FREE_MEM, THROTTLED_QUIET
     THROTTLED_DISABLE=1  bypass the gate entirely and just run the command
 
 EXAMPLES
     $PROG yarn build
-    $PROG -p 0.7 -i 1m yarn test:run
+    $PROG -p 0.7 yarn test:run
     $PROG -w 8m --then fail yarn build || echo "still busy, try again later"
     $PROG --check
 EOF
@@ -126,23 +142,26 @@ need_arg() {
 CHECK_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        -p|--per-cpu)     need_arg "$1" $#; PER_CPU=$2; MAX_LOAD=; shift 2 ;;
-        -l|--max-load)    need_arg "$1" $#; MAX_LOAD=$2; shift 2 ;;
-        -m|--metric)      need_arg "$1" $#; METRIC=$2; shift 2 ;;
-        -i|--interval)    need_arg "$1" $#; INTERVAL_SPEC=$2; shift 2 ;;
-        -w|--max-wait)    need_arg "$1" $#; MAX_WAIT_SPEC=$2; shift 2 ;;
-        -n|--nice)        need_arg "$1" $#; NICE=$2; shift 2 ;;
-        --then)           need_arg "$1" $#; ON_TIMEOUT=$2; shift 2 ;;
-        --min-free-mem)   need_arg "$1" $#; MIN_FREE_MEM=$2; shift 2 ;;
-        --no-mem)         CHECK_MEM=0; shift ;;
-        --no-jitter)      JITTER=0; shift ;;
-        -c|--check)       CHECK_ONLY=1; shift ;;
-        -q|--quiet)       QUIET=1; shift ;;
-        -h|--help)        usage; exit 0 ;;
-        --version)        printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
-        --)               shift; break ;;
-        -*)               die "unknown option: $1 (try --help)" $EX_USAGE ;;
-        *)                break ;;
+        -p|--per-cpu)      need_arg "$1" $#; PER_CPU=$2; MAX_LOAD=; shift 2 ;;
+        -l|--max-load)     need_arg "$1" $#; MAX_LOAD=$2; shift 2 ;;
+        -m|--metric)       need_arg "$1" $#; METRIC=$2; shift 2 ;;
+        -i|--interval)     need_arg "$1" $#; INTERVAL_SPEC=$2; shift 2 ;;
+        -r|--report)       need_arg "$1" $#; REPORT_SPEC=$2; shift 2 ;;
+        -w|--max-wait)     need_arg "$1" $#; MAX_WAIT_SPEC=$2; shift 2 ;;
+        -n|--nice)         need_arg "$1" $#; NICE=$2; shift 2 ;;
+        --then)            need_arg "$1" $#; ON_TIMEOUT=$2; shift 2 ;;
+        --min-idle)        need_arg "$1" $#; MIN_IDLE=$2; shift 2 ;;
+        --min-free-mem)    need_arg "$1" $#; MIN_FREE_MEM=$2; shift 2 ;;
+        --no-idle-rescue)  IDLE_RESCUE=0; shift ;;
+        --no-mem)          CHECK_MEM=0; shift ;;
+        --no-jitter)       JITTER=0; shift ;;
+        -c|--check)        CHECK_ONLY=1; shift ;;
+        -q|--quiet)        QUIET=1; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        --version)         printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        --)                shift; break ;;
+        -*)                die "unknown option: $1 (try --help)" $EX_USAGE ;;
+        *)                 break ;;
     esac
 done
 
@@ -156,9 +175,11 @@ case "$ON_TIMEOUT" in
 esac
 is_number "$PER_CPU" || die "--per-cpu must be a number (got: $PER_CPU)" $EX_USAGE
 [ -z "$MAX_LOAD" ] || is_number "$MAX_LOAD" || die "--max-load must be a number (got: $MAX_LOAD)" $EX_USAGE
+is_number "$MIN_IDLE" || die "--min-idle must be a number (got: $MIN_IDLE)" $EX_USAGE
 is_number "$MIN_FREE_MEM" || die "--min-free-mem must be a number (got: $MIN_FREE_MEM)" $EX_USAGE
 
 INTERVAL=$(parse_duration "$INTERVAL_SPEC") || die "bad --interval: $INTERVAL_SPEC" $EX_USAGE
+REPORT=$(parse_duration "$REPORT_SPEC") || die "bad --report: $REPORT_SPEC" $EX_USAGE
 MAX_WAIT=
 if [ -n "$MAX_WAIT_SPEC" ]; then
     MAX_WAIT=$(parse_duration "$MAX_WAIT_SPEC") || die "bad --max-wait: $MAX_WAIT_SPEC" $EX_USAGE
@@ -197,6 +218,32 @@ load_avg() {
         return
     fi
     uptime | awk -v f="$field" -F'load averages?: ' '{ split($2, a, /[, ]+/); print a[f] }'
+}
+
+# Instantaneous CPU idle %, sampled over ~1s. Empty output = couldn't measure,
+# which disables the rescue rather than guessing.
+cpu_idle() {
+    local a b
+    if [ -r /proc/stat ]; then
+        a=$(awk '/^cpu / { t = 0; for (i = 2; i <= NF; i++) t += $i; print t, $5; exit }' /proc/stat)
+        nap 1
+        b=$(awk '/^cpu / { t = 0; for (i = 2; i <= NF; i++) t += $i; print t, $5; exit }' /proc/stat)
+        printf '%s %s\n' "$a" "$b" | awk '{ dt = $3 - $1; di = $4 - $2; if (dt > 0) printf "%.0f\n", di * 100 / dt }'
+        return
+    fi
+    if command -v iostat >/dev/null 2>&1; then
+        iostat -c 2 2>/dev/null | awk '
+            /(^|[ \t])id([ \t]|$)/ { for (i = 1; i <= NF; i++) if ($i == "id") idx = i; next }
+            idx { last = $idx }
+            END { if (last ~ /^[0-9.]+$/) printf "%.0f\n", last }'
+        return
+    fi
+    if command -v top >/dev/null 2>&1; then
+        top -l 2 -n 0 -s 1 2>/dev/null | awk '
+            /^CPU usage/ { for (i = 1; i <= NF; i++) if ($i == "idle") { v = $(i - 1); gsub(/%/, "", v) } }
+            END { if (v ~ /^[0-9.]+$/) printf "%.0f\n", v }'
+        return
+    fi
 }
 
 # Prints "ok|<detail>" or "busy|<detail>". macOS exposes the kernel's own
@@ -260,16 +307,17 @@ else
 fi
 
 status_line() {
-    local load=$1 mem=$2
-    printf 'load%s %s (%s/cpu) · %s · %s' \
+    printf 'load%s %s (%s/cpu) · %s%s · %s' \
         "$METRIC" \
-        "$(awk -v l="$load" 'BEGIN { printf "%.2f", l }')" \
-        "$(awk -v l="$load" -v n="$NCPU" 'BEGIN { printf "%.2f", l / n }')" \
+        "$(awk -v l="$LOAD" 'BEGIN { printf "%.2f", l }')" \
+        "$(awk -v l="$LOAD" -v n="$NCPU" 'BEGIN { printf "%.2f", l / n }')" \
         "$CEILING_NOTE" \
-        "$mem"
+        "${IDLE_NOTE:+ · $IDLE_NOTE}" \
+        "$MEM_NOTE"
 }
 
 gate() {
+    local raw idle
     LOAD=$(load_avg)
     case "$LOAD" in
         ''|*[!0-9.]*) LOAD=0 ;;
@@ -277,15 +325,23 @@ gate() {
     MEM_STATE=ok
     MEM_NOTE='mem skipped'
     if [ "$CHECK_MEM" = 1 ]; then
-        local raw
         raw=$(mem_state)
         MEM_STATE=${raw%%|*}
         MEM_NOTE=${raw#*|}
     fi
     REASON=
+    IDLE_NOTE=
     if ! awk -v a="$LOAD" -v b="$CEILING" 'BEGIN { exit !(a <= b) }'; then
-        REASON="load is high"
-    elif [ "$MEM_STATE" = busy ]; then
+        idle=
+        [ "$IDLE_RESCUE" = 1 ] && idle=$(cpu_idle)
+        if [ -n "$idle" ] && awk -v i="$idle" -v m="$MIN_IDLE" 'BEGIN { exit !(i >= m) }'; then
+            IDLE_NOTE="${idle}% idle, spike decaying"
+        else
+            REASON="load is high"
+            [ -n "$idle" ] && IDLE_NOTE="${idle}% idle"
+        fi
+    fi
+    if [ "$MEM_STATE" = busy ]; then
         REASON="memory is tight"
     fi
     [ -z "$REASON" ]
@@ -298,27 +354,31 @@ fi
 
 if [ $CHECK_ONLY -eq 1 ]; then
     if gate; then
-        printf '%s · %sOK%s\n' "$(status_line "$LOAD" "$MEM_NOTE")" "$C_GREEN" "$C_OFF"
+        printf '%s · %sOK%s\n' "$(status_line)" "$C_GREEN" "$C_OFF"
         exit 0
     fi
-    printf '%s · %sBUSY%s (%s)\n' "$(status_line "$LOAD" "$MEM_NOTE")" "$C_RED" "$C_OFF" "$REASON"
+    printf '%s · %sBUSY%s (%s)\n' "$(status_line)" "$C_RED" "$C_OFF" "$REASON"
     exit 1
 fi
 
 START=$(date +%s)
-ATTEMPT=0
+LAST_REPORT=
+REPORT_INT=${REPORT%%.*}
 
 while :; do
+    CYCLE_START=$(date +%s)
     if gate; then
-        if [ $ATTEMPT -gt 0 ]; then
-            say "${C_GREEN}ok${C_OFF} after $(human_secs $(( $(date +%s) - START ))) — $(status_line "$LOAD" "$MEM_NOTE")"
+        WAITED=$(( $(date +%s) - START ))
+        if [ -n "$LAST_REPORT" ]; then
+            say "${C_GREEN}ok${C_OFF} after $(human_secs "$WAITED") — $(status_line)"
         else
-            say "ok — $(status_line "$LOAD" "$MEM_NOTE")"
+            say "ok — $(status_line)"
         fi
         break
     fi
 
-    ELAPSED=$(( $(date +%s) - START ))
+    NOW=$(date +%s)
+    ELAPSED=$(( NOW - START ))
     if [ -n "$MAX_WAIT" ] && awk -v e="$ELAPSED" -v m="$MAX_WAIT" 'BEGIN { exit !(e >= m) }'; then
         if [ "$ON_TIMEOUT" = run ]; then
             say "waited $(human_secs "$ELAPSED") (--max-wait $MAX_WAIT_SPEC) — running anyway"
@@ -326,20 +386,29 @@ while :; do
         fi
         printf '%s %s%s%s after %s (--max-wait %s) — %s\n' \
             "$TAG" "$C_RED" "giving up" "$C_OFF" "$(human_secs "$ELAPSED")" \
-            "$MAX_WAIT_SPEC" "$(status_line "$LOAD" "$MEM_NOTE")" >&2
+            "$MAX_WAIT_SPEC" "$(status_line)" >&2
         exit $EX_TEMPFAIL
     fi
 
-    NAP=$INTERVAL
-    if [ "$JITTER" = 1 ]; then
-        NAP=$(awk -v i="$INTERVAL" -v r="$RANDOM" 'BEGIN { printf "%.1f", i * (0.8 + 0.4 * (r % 1000) / 1000) }')
+    if [ -z "$LAST_REPORT" ]; then
+        say "${C_RED}${REASON}${C_OFF} — $(status_line) · re-checking every $INTERVAL_SPEC"
+        LAST_REPORT=$NOW
+    elif [ $(( NOW - LAST_REPORT )) -ge "$REPORT_INT" ]; then
+        say "still waiting — $(status_line) · $(human_secs "$ELAPSED")"
+        LAST_REPORT=$NOW
     fi
+
+    NAP=$(awk -v i="$INTERVAL" -v spent="$(( $(date +%s) - CYCLE_START ))" \
+        -v j="$JITTER" -v r="$RANDOM" 'BEGIN {
+            n = i
+            if (j == 1) { n = i * (0.8 + 0.4 * (r % 1000) / 1000) }
+            n -= spent
+            if (n < 0.1) { n = 0.1 }
+            printf "%.1f", n
+        }')
     if [ -n "$MAX_WAIT" ]; then
         NAP=$(awk -v n="$NAP" -v e="$ELAPSED" -v m="$MAX_WAIT" 'BEGIN { left = m - e; if (left < n) n = left; if (n < 0.1) n = 0.1; printf "%.1f", n }')
     fi
-
-    ATTEMPT=$(( ATTEMPT + 1 ))
-    say "${C_RED}${REASON}${C_OFF} — $(status_line "$LOAD" "$MEM_NOTE") · waited $(human_secs "$ELAPSED") · retry in $(human_secs "$NAP")"
     nap "$NAP"
 done
 
