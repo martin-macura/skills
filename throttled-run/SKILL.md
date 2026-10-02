@@ -76,6 +76,21 @@ disown
 
 `THROTTLED_DISABLE=1` bypasses the gate entirely (CI, or when you know you want it now). Defaults also come from `THROTTLED_PER_CPU`, `THROTTLED_MAX_LOAD`, `THROTTLED_METRIC`, `THROTTLED_INTERVAL`, `THROTTLED_REPORT`, `THROTTLED_MAX_WAIT`, `THROTTLED_MIN_IDLE`, `THROTTLED_MIN_FREE_MEM`, `THROTTLED_QUIET`.
 
+## Making it automatic (the whole machine, not just this skill)
+
+Remembering the prefix is the part that fails. Two ready-made layers live in `hooks/` next to this
+file — `hooks/README.md` has the reasoning, the install lines and what is deliberately *not* done:
+
+- **`hooks/zshrc-snippet.zsh`** — a `yarn()` function for `~/.zshrc` that routes the heavy scripts
+  through the gate. Claude Code runs its Bash tool in **zsh** and sources a snapshot of your shell
+  functions, so one function covers your own terminal *and* every agent and subagent, with no change
+  to prompts, skills or permissions. (Aliases don't survive the snapshot — it opens with
+  `unalias -a` — functions do.)
+- **`hooks/throttle-bash.sh`** — a `PreToolUse(Bash)` hook that stays silent while the load is under
+  the ceiling and, only on a busy machine, refuses a heavy command and hands back the exact
+  `throttled …` line to use. It rewrites nothing and runs nothing itself, so the permission model is
+  untouched. Covers what the wrapper can't see: `npx playwright`, a bare `vitest`, `docker build`.
+
 ## Don't gate these
 
 The wait only pays off for jobs that are themselves heavy and interruptible-by-nature. Leave alone: dev servers you're waiting on, anything interactive, git commands, single-file `yarn test:run <file>`, and anything a human is watching a prompt for.

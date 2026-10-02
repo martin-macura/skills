@@ -30,6 +30,14 @@ reads a skill's `description` to decide when it applies.
   values, then converge with an injected difference overlay, pixelmatch, and
   computed-style audits. Ground truth is the Figma raster; generated code is
   only ever a draft.
+- **[full-review](full-review/SKILL.md)** — Run both review skills over one
+  committed SHA, in order and to completion: the four-lens `/parallel-review`
+  panel first (sweep, triage, fixes, cockpit), then `/qa-swarm` as a second
+  independent sample over the fixed tree, with one shared preflight (fetch,
+  trial merge, snapshot chain, open PRs), one merged triage where the swarm is
+  one voice, and one hand-over that states what ran. Exists because
+  `/qa-swarm /parallel-review` on one line runs only the first skill — the
+  second name is parsed as its argument. Explicit `/full-review` only.
 - **[issue-worklog](issue-worklog/SKILL.md)** — Summarize the GitHub issues you
   worked on in a repo over a time window — each issue's branch/PR with the
   per-day commit time ranges, in local time, plus a done/in-flight status.

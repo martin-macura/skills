@@ -49,9 +49,11 @@ closingIssuesReferences,reviews,reviewRequests,commits,comments
 Report one row per PR with:
 
 - **Issue binding** — bound if `closingIssuesReferences` is non-empty, **or** the body has a closing
-  keyword (`Fixes/Closes/Resolves #N`) or a `Relates: #N` trailer. Cross-check the branch pattern
-  `<feat|fix>/<issue>-...`. Flag mismatches explicitly: `bound #N`, `branch implies #N but not linked`,
-  `#N via Relates only (not a closing link)`, or `no bound issue`.
+  keyword (`Fixes/Closes/Resolves #N`) or a `Relates: #N` trailer. List **every** entry — a batch PR
+  closes several issues, so report `bound #1089, #1093, #1192` rather than just the first (the `#NNN`
+  in the title is only one of them). Cross-check the branch pattern `<feat|fix>/<issue>-...`. Flag
+  mismatches explicitly: `bound #N`, `branch implies #N but not linked`, `#N via Relates only (not a
+  closing link)`, or `no bound issue`.
 - **My review** — latest review state from `ME` (APPROVED / CHANGES_REQUESTED / COMMENTED) + date, or
   `none`. **A `PENDING` review is an unsubmitted draft — treat it as "no submitted review" (i.e. still
   a first review owed by me), but note the draft exists.**

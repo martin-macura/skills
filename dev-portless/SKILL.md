@@ -15,14 +15,11 @@ The user wants to run the app locally — typically to verify a change, walk thr
 
 If the user just wants `yarn dev` raw on `http://localhost:3000`, follow that instruction instead. This skill is for the portless workflow.
 
-Once the server is up, the recipe opens the URL in **Chrome Canary** automatically (see "Opening in Chrome Canary") — **unless you (Claude) are the one reviewing the app**, in which case skip the open entirely (see "Who's looking: you vs. the user").
+The launcher only starts the server — it never opens a browser itself. Once the server actually serves, you open it in the **Claude browser pane** (see "Opening it").
 
-## Who's looking: you vs. the user
+## One surface for both audiences
 
-Decide the audience before running, and pass the `--open` flag to the launcher accordingly:
-
-- **The user wants to look** — they asked to preview a worktree, walk a flow, or get a URL to hand off. Run `bash "$SCRIPT" --open` so Chrome Canary opens once the server is serving.
-- **You (Claude) want to look** — you're starting the server so *you* can review/screenshot/drive the app yourself through the preview MCP tools (`mcp__Claude_Preview__*`) or Claude-in-Chrome. **Do not** pass `--open` — popping Chrome Canary on the user's screen is noise they didn't ask for. Run `bash "$SCRIPT"` (no flag), then point your own preview tooling at the URL.
+There is no audience decision to make any more. The Claude browser pane is visible to the user *and* drivable by you, so the same tab serves "the user wants to look" and "you want to screenshot it". Start the server, wait for it to serve, open the pane.
 
 When in doubt — e.g. the request is "see if the app works" with no stated audience — assume you're reviewing it yourself and skip the open; surface the URL in chat so the user can open it too if they want.
 
@@ -39,7 +36,7 @@ Everything is derived automatically — you normally run the recipe as-is, no va
 
 ## The recipe
 
-Two steps: **(1)** generate a per-app launcher script — once — with the derived values (app name, URL, paths, DevTools base port) and its own pathname inlined; **(2)** run it. On later runs the script already exists, so you skip straight to step 2. All the project/branch derivation happens at generation time and is baked in, so the **script itself only** picks a free DevTools port, starts the server behind portless, and — when passed `--open` — opens Chrome Canary once the server is actually serving.
+Two steps: **(1)** generate a per-app launcher script — once — with the derived values (app name, URL, paths, DevTools base port) and its own pathname inlined; **(2)** run it. On later runs the script already exists, so you skip straight to step 2. All the project/branch derivation happens at generation time and is baked in, so the **script itself only** picks a free DevTools port and starts the server behind portless. It opens nothing: the Claude browser pane is an MCP surface, not something a shell command can reach.
 
 ```bash
 # --- derive a stable project name + main checkout (works in linked worktrees too) ---
@@ -74,7 +71,7 @@ SCRIPT="$PWD/dev-portless.sh"
 # hand-edit it; change the skill instead.
 {
     printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
-    printf '%s\n' "# dev-portless launcher (generated) — re-run with: bash $SCRIPT [--open]"
+    printf '%s\n' "# dev-portless launcher (generated) — re-run with: bash $SCRIPT"
     printf 'SELF=%q\n'          "$SCRIPT"          # this script's own pathname, inlined
     printf 'APP_NAME=%q\n'      "$APP_NAME"
     printf 'PORTLESS_URL=%q\n'  "$PORTLESS_URL"
@@ -92,16 +89,6 @@ test -f .env.local || cp "$MAIN_CHECKOUT/.env.local" .env.local
 while lsof -nP -iTCP:"$DEVTOOLS_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
     DEVTOOLS_PORT=$((DEVTOOLS_PORT + 10))
 done
-
-# --open: once the dev server actually serves (2xx/3xx — not the bare proxy, which 502/404s during
-# boot), open Chrome Canary. Backgrounded waiter; gives up after ~120s so a crashed boot won't hang.
-if [ "${1:-}" = "--open" ]; then
-    ( for _ in $(seq 1 120); do
-        code=$(curl -sko /dev/null -w '%{http_code}' "$PORTLESS_URL" || true)
-        case "$code" in 2??|3??) open -a "Google Chrome Canary" "$PORTLESS_URL"; break ;; esac
-        sleep 1
-      done ) &
-fi
 
 exec env \
     BETTER_AUTH_URL="$PORTLESS_URL" \
@@ -121,27 +108,27 @@ echo "launcher: $SCRIPT"
 echo "app: $APP_NAME   url: $PORTLESS_URL"
 ```
 
-Then **run the launcher** via `run_in_background: true` (the chat stays free; the server runs until the user stops it or you `TaskStop`). Pass `--open` only when the **user** is the viewer; omit it when you're reviewing through your own tooling (see "Who's looking"):
+Then **run the launcher** via `run_in_background: true` (the chat stays free; the server runs until the user stops it or you `TaskStop`). It takes no flags:
 
 ```bash
-bash "$SCRIPT"          # you (Claude) review via preview MCP / Claude-in-Chrome — nothing opens
-bash "$SCRIPT" --open   # the user wants to look — opens Chrome Canary once it's serving
+bash "$SCRIPT"          # starts the server; opens nothing — you open the pane yourself
 ```
 
 App will be reachable at `https://<project>-<branch-slug>.localhost:1355` (e.g. `https://siegl-app-728-admin-filtration.localhost:1355`).
 
-## Opening in Chrome Canary
+## Opening it
 
-With `--open`, the launcher opens the URL in Chrome Canary once the **dev server is actually serving** (a 2xx/3xx upstream response). It does *not* open on the portless proxy alone being reachable — the proxy answers before `yarn dev` is up and returns a 502/404, so opening then would land Canary on an error page. Without the flag (you're reviewing the app yourself) nothing opens — use the preview MCP tools against the URL instead. To open (or re-open) it by hand — e.g. after a restart, or to hand the user a copy-pasteable command — use:
+The Claude browser pane is an MCP surface, so *you* open it — the launcher can't:
 
-```bash
-open -a "Google Chrome Canary" "https://<project>-<branch-slug>.localhost:1355"
+```
+mcp__Claude_Browser__preview_start   { url: "https://<project>-<branch-slug>.localhost:1355" }
 ```
 
-- `-a "Google Chrome Canary"` targets Canary specifically (bundle id `com.google.Chrome.canary`), not the OS default browser. Substitute the actual derived URL (`$PORTLESS_URL` is only set inside the recipe's shell; a fresh `Bash` call won't have it).
-- Open it only **after** the dev server is serving — both Canary racing the boot (connection error) and the portless proxy answering before `yarn dev` is up (502/404 error page) produce a broken first load. When opening by hand, wait for the success line in the output, or poll until the URL returns a 2xx/3xx (`curl -sko /dev/null -w '%{http_code}' "$PORTLESS_URL"`).
-- Markdown links you surface in chat open in the user's *default* browser, not Canary. So when you give the user the URL, also give them the `open -a "Google Chrome Canary" …` one-liner so they can land in Canary themselves.
-- If Canary isn't installed (`ls "/Applications/Google Chrome Canary.app"` fails), fall back to `open "$PORTLESS_URL"` (default browser) and mention it.
+Use `tabs_create` + `navigate` instead when the pane already holds something that should stay (a cockpit, a comparison page).
+
+- **Wait for a 2xx/3xx first.** The portless proxy answers *before* `yarn dev` is up and returns 502/404, so opening too early lands on an error page. Poll `curl -sko /dev/null -w '%{http_code}' "$PORTLESS_URL"` — `$PORTLESS_URL` only exists inside the recipe's shell, so a fresh `Bash` call needs the literal URL.
+- **A blank first page is usually Vite, not a crash.** On a cold worktree Vite re-optimizes deps mid-hydration and blanks the page; the server output says `optimized dependencies changed. reloading`. Navigate again — that's the fix.
+- **Markdown links you put in chat open in the user's *default* browser**, not the pane. Surface the URL there anyway, so they can open it where they prefer.
 
 ## Why each env var
 

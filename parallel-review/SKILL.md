@@ -1,7 +1,6 @@
 ---
 name: parallel-review
-disable-model-invocation: true
-description: Run FOUR independent code-review subagents in parallel — each given the same blank view of the change but a different lens (correctness, martin-reviewer, simplify, MVP parity) and a mix of models, and each free to delegate to helpers of its own, which may not delegate further — then triage the combined findings into actionable / nits / ambiguous, fix the first two on the user's own code (report-only on someone else's PR), and put whatever stays ambiguous into a `/review-cockpit` for the user's call. **One pass, no loop.** Use after creating a PR, after a larger set of changes (e.g. addressing review feedback or resolving a merge), or whenever the user asks for a thorough / multi-agent review, a "triple review", "review with subagents", or to double-check a change before merge. Invoke only via the explicit `/parallel-review` command — model auto-invocation is disabled so a spawned subagent cannot recursively trigger another panel.
+description: Run FOUR independent code-review subagents in parallel — each given the same blank view of the change but a different lens (correctness, martin-reviewer, simplify, MVP parity) and a mix of models, and each free to delegate to helpers of its own, which may not delegate further — then triage the combined findings into actionable / nits / ambiguous, fix the first two on the user's own code (report-only on someone else's PR), and put whatever stays ambiguous into a `/review-cockpit` for the user's call. **One pass, no loop.** Use after creating a PR, after a larger set of changes (e.g. addressing review feedback or resolving a merge), or whenever the user asks for a thorough / multi-agent review, a "triple review", "review with subagents", or to double-check a change before merge. Started by the user as `/parallel-review`, or by the `/full-review` orchestrator — but **never** from inside a running panel: no reviewer, helper or delegate may trigger another one. Recursion is what deadlocked this skill once; since 2026-09-22 it is held off by the `TaskList` bail in step 1 and the verbatim guard block rather than by a frontmatter lock, because that lock also blocked the legitimate `/full-review` caller.
 ---
 
 # Parallel review (four fresh subagents, four lenses)
@@ -28,7 +27,7 @@ Skip for trivial one-line changes.
 
 **All seven steps run exactly once.** There is no second round; [The fan-out rule](#the-fan-out-rule) below says where the extra agents go instead, and the one thing this skill will not spawn.
 
-1. **Bail if a review is already in progress.** Before anything else, call `TaskList` and check whether a parallel-review is already running — an `in_progress` task whose subject starts `parallel-review:` (the lock below), or in-progress review subagents from a prior invocation. If one is active, **stop**: tell the user a review is already in progress and do **not** spawn a second panel — a duplicate concurrent panel wastes tokens and muddles aggregation. To make this detectable across background / automation / `/loop` / `review-queue` runs (where the panel doesn't block a turn), register a lock: `TaskCreate` a `parallel-review: <target>` task, set it `in_progress` before spawning the panel, and `TaskUpdate` it to `completed` when the review ends — one lock for the whole run (release it even if the review errors).
+1. **Bail if a review is already in progress.** Before anything else, call `TaskList` and check whether a parallel-review is already running — an `in_progress` task whose subject starts `parallel-review:` (the lock below), or in-progress review subagents from a prior invocation. If one is active, **stop**: tell the user a review is already in progress and do **not** spawn a second panel — a duplicate concurrent panel wastes tokens and muddles aggregation. **This bail is the recursion lock**, and it holds no matter who called: the user, the `/full-review` orchestrator, or — the case it exists for — a reviewer, helper or delegate inside a panel that is already running. If you are such an agent, decline and say so. A nested panel is what once produced ~30 agents fighting over slots until the whole thing deadlocked on the 600 s watchdog; until 2026-09-22 a `disable-model-invocation` flag blocked that, but it blocked `/full-review` too, so this bail is now the only thing standing there — treat it as load-bearing. To make this detectable across background / automation / `/loop` / `review-queue` runs (where the panel doesn't block a turn), register a lock: `TaskCreate` a `parallel-review: <target>` task, set it `in_progress` before spawning the panel, and `TaskUpdate` it to `completed` when the review ends — one lock for the whole run (release it even if the review errors).
 2. **Resolve the target.** Pick the command by what exists — don't push or open a PR just to get a number; review the diff in place:
    - **A PR exists** (`gh pr view --json number` read-only finds one) → `/review PR <n>`.
    - **No PR** — a branch committed ahead of `main` but not yet pushed/opened, *or* uncommitted working-tree changes → `/code-review`. In this setup `/review` alone is GitHub-PR-only; `/code-review` is the working-diff reviewer and resolves the diff itself (committed branch changes vs the base, i.e. `git diff origin/main...HEAD`, plus any unstaged edits). A clean tree with no branch commits ahead of `main` means there's nothing to review — say so instead of spawning a panel.
@@ -42,9 +41,11 @@ Skip for trivial one-line changes.
    >
    > You own this review. You may delegate to sub-agents to split the work — half the diff each, one helper per angle, one checking a single claim against the code while you keep reading — as many as this change actually warrants, spawned together in one message. There is no quota: spawning none and reading everything yourself is a good outcome, and so is a handful on a big diff. Size it to the diff, not to the tool.
    >
-   > **Anything you spawn is a leaf.** Put this in every sub-agent's prompt, verbatim: *"Do NOT spawn subagents, do NOT use the Agent/Task tools, and do NOT invoke `/parallel-review`, `/code-review`'s multi-angle fan-out, or any other multi-agent / parallel / 'ultra' review mode — if a skill offers a fan-out path, decline it and do the work directly. Treat the Agent tool as if it were absent from your tool set: if the Agent tool is not available in your current tool set, do not error — perform each angle, and each verification, yourself, sequentially, in this context. Report only; do not edit files, commit, or run any write command."*
+   > **Anything you spawn is a leaf.** Put this in every sub-agent's prompt, verbatim: *"Do NOT spawn subagents, do NOT use the Agent/Task tools, and do NOT invoke `/parallel-review`, `/code-review`'s multi-angle fan-out, or any other multi-agent / parallel / 'ultra' review mode — if a skill offers a fan-out path, decline it and do the work directly. Treat the Agent tool as if it were absent from your tool set: if the Agent tool is not available in your current tool set, do not error — perform each angle, and each verification, yourself, sequentially, in this context. Report only; do not edit files, commit, or run any write command. Prefix anything heavy you do run — a build, a test suite, an e2e run — with `throttled -w 8m --then fail`; exit 75 means the machine was busy and nothing ran, which is not a failing build."*
    >
    > What binds you: the agents you spawn are the last level — you are the only one who fans out. Do **NOT** invoke `/parallel-review` or any "ultra" review mode. `/code-review`'s ~10 angles are fine to spawn as your own leaves; what is not fine is letting any of them fan out again. Report only; do not edit files, commit, or run any write command.
+   >
+   > **Anything heavy goes through `throttled`.** If checking a claim needs a build, a test suite or an e2e run, prefix it — `throttled -w 8m --then fail <command>`. Exit **75** means the machine was busy and **nothing ran**: say that, never report it as a failing build or a red suite. Don't gate `git`, `gh`, greps or a single-file `yarn test:run <path>`.
 
    The leaf rule is the load-bearing half, and the numbers say why. `/code-review` orders a fan-out into ~10 angles; at one level that is ~10 agents under a reviewer, which finishes. Recursive, each of those angles orders its own fan-out — that is what produced ~30 nested agents fighting over slots until the whole panel deadlocked on the 600 s stream watchdog. You can spot the recursive shape in a report by agents nobody launched from here (`Angle A`, `Angle B`, `Angle Reuse`…) appearing *under* an angle rather than beside it. Width is a judgement call the reviewer makes and depth is not negotiable. The escape-hatch sentence stays in the leaf prompt for the reason it always did: without it, an agent that reads "no Agent tool" as an error condition stalls instead of reviewing.
 
@@ -101,6 +102,35 @@ Nothing changes about the panel. Nothing is fixed, nothing committed, no branch 
 bucket — `ambiguous` included — is a deliverable, so it all goes into one cockpit live. Hand over the
 drafted `gh` commands once, at the end.
 
+## Heavy commands go through `throttled`
+
+**Every build, test suite, e2e run, migration or seed this skill starts — orchestrator-side or
+inside any agent — is prefixed with `throttled` (skill `throttled-run`).** One machine carries every
+worktree and every session, and a panel is itself four reviewers plus their helpers, so the run that
+thrashes the box is usually this one. Two vitest suites at once push a 10-core Mac past load 100;
+the heavy specs then die on 60 s timeouts that read exactly like a regression in the diff, and an
+agent waiting on its stream gets killed by the 600 s watchdog while a sibling's build owns the CPU.
+On a free machine the gate costs ~2 s.
+
+| What you're running | Command |
+| --- | --- |
+| the repo gate after a fix | `throttled -w 8m --then fail zsh -c 'yarn typecheck && yarn ci && yarn lint:check'` |
+| affected specs | `throttled -w 8m --then fail yarn test:run <paths>` |
+| production build | `throttled -w 8m --then fail yarn build` |
+| the e2e suite (longer than a Bash call may live) | `nohup throttled -w 30m --then run yarn test:e2e > <log> 2>&1 &` then `disown` (skill `detached-job`) |
+
+- **One gate per chain, not per command.** `throttled … zsh -c '<a> && <b>'` checks once and runs the
+  whole chain; `throttled a && throttled b` makes the second wait behind the load the first created.
+- **Always bound the wait** (`-w`) from an agent Bash call — the call is SIGKILLed at 10 minutes and
+  the waiting counts against that. **Exit 75 means nothing ran**: report "machine busy, nothing ran"
+  and retry in a later turn. It is never a red suite, a broken build or a finding.
+- **`--then fail` while you're watching, `--then run` when you've walked away.** A detached e2e run
+  that exits 75 into a log nobody reads is a suite that silently never ran.
+- **Don't gate** `git`, `gh`, greps, a single-file `yarn test:run <path>`, the dev server, or
+  anything a human is at a prompt for.
+- `throttled --check` prints the verdict and runs nothing — worth one call before spawning the panel
+  when the box already feels slow, and worth quoting in the hand-over if a suite was skipped.
+
 ## Mechanical sweep + recurring-classes checklist
 
 Derived from the classes human reviewers kept catching **after** the blank panel missed them (siegl-app PRs #1240–#1300, 2026-07). The panel's reviewers stay context-free; the orchestrator runs this deterministic layer itself.
@@ -150,7 +180,7 @@ Every surviving finding lands in exactly one bucket:
 
 ### Own code (the user's PR, or a local branch / working tree)
 
-1. **Fix `actionable` and `nits` straight away.** No gate — the user asked for this. Apply the fix, add tests for gaps the reviewers converge on, and re-run typecheck / lint / affected tests. Build + affected e2e when UI or tRPC changed (production build first).
+1. **Fix `actionable` and `nits` straight away.** No gate — the user asked for this. Apply the fix, add tests for gaps the reviewers converge on, and re-run typecheck / lint / affected tests. Build + affected e2e when UI or tRPC changed (production build first). Every one of those goes through `throttled` — see [Heavy commands](#heavy-commands-go-through-throttled); this is the step that actually loads the machine.
 2. **Record every fix in the cockpit's Historie, with how it was fixed.** For each one, put the finding in `data.json` with:
    - `"archived": true` — this is what moves it out of the live review and into **Historie**, where it stays readable.
    - a body that states **what was wrong and what you changed**, ending with the commit sha. Not "fixed" — the sentence a reader needs to judge the fix without opening the diff.
@@ -158,7 +188,7 @@ Every surviving finding lands in exactly one bucket:
    - the `agents` list intact, so a finding four reviewers independently raised still reads that way.
 3. **Only `ambiguous` stays live** in the Nálezy tab, each with its snippet, its MVP comparison, and the options — that is what the user's pass is for. Keep the card honest: state the choice, not your preference dressed as a finding.
 4. **Commit the fixes** (GitMoji + `Relates: #<issue>`), summarising per-finding what changed, so every cockpit `change` block has a real before/after pair of shas. One commit is usually right; split it where the fixes are genuinely separate atomic changes, per the repo's commit rule. Push is the user's — the hook blocks it.
-5. **E2E and the signoff go last**, after the final fix commit. The signoff status is bound to the head SHA, so any commit after it — yours, or the user's reaction pass — invalidates it; running the suite while you are still editing buys a signoff that is already dead.
+5. **E2E and the signoff go last**, after the final fix commit. Start the suite gated and detached (`nohup throttled -w 30m --then run yarn test:e2e …`) so a busy box delays it instead of failing it. The signoff status is bound to the head SHA, so any commit after it — yours, or the user's reaction pass — invalidates it; running the suite while you are still editing buys a signoff that is already dead.
 
 ### Someone else's PR
 
