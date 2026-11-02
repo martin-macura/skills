@@ -34,7 +34,7 @@ Several worktrees/sessions share one machine. Two full vitest suites at once pus
 | Just look at the machine first | `throttled --check` |
 | Be stricter (leave headroom) | `throttled -p 0.5 yarn test:run` |
 | Be lenient, just don't thrash | `throttled -p 2 yarn typecheck` |
-| Run regardless, but politely | `throttled -p 99 -n 10 yarn build` |
+| Run regardless, but politely (see "Niceness" below) | `throttled -p 99 -n 10 yarn build` |
 | Gate on the smoothed average | `throttled -m 5 yarn test:e2e` |
 
 Full option list: `throttled --help`.
@@ -45,8 +45,17 @@ Full option list: `throttled --help`.
 - **Waiting costs at most ~2 s of start latency.** Reading the load is a `sysctl`, so the check runs every 2 s (`-i`) while the printed line is throttled to once every 30 s (`-r`) to keep the output readable. Don't raise `-i` to quieten it — that only delays the start; raise `-r`.
 - **The load average lags.** It decays with a one-minute time constant, so it sits above the ceiling long after the machine is actually free — that lag was most of the "waited a minute for nothing" feeling. When the load is over the ceiling, `throttled` samples instantaneous CPU idle (`iostat`/`top`/`/proc/stat`, ~1 s) and starts anyway if the box is genuinely idle — 60 % by default, `--min-idle`. `--no-idle-rescue` gives pure load-average semantics; note the rescue overrides an explicit `-l` too, so a deliberately-blocking ceiling like `-l 0.01` needs it.
 - `-m 1` (default) reacts the moment a spike ends; `-m 5` waits for the machine to actually stay calm. Use `-m 5` for a long job you don't want to abandon at the first dip.
-- A **memory gate** runs alongside, and it vetoes even a successful idle rescue: macOS reads the kernel's own pressure level (`kern.memorystatus_vm_pressure_level`, blocks at warn/critical), Linux requires `MemAvailable` ≥ `--min-free-mem` % (default 10). Disable with `--no-mem`. Note macOS reports pressure `normal` even while swap is nearly full, so treat it as a veto for the genuinely bad case, not as a general memory check.
+- A **memory gate** runs alongside, and it vetoes even a successful idle rescue: macOS reads the kernel's own pressure level (`kern.memorystatus_vm_pressure_level`) and blocks only at **critical** by default; `--mem-level warn` (`THROTTLED_MEM_LEVEL`) brings back the stricter veto. Warn is tolerated because a swap that stays full parks the kernel there for hours while load is low and nothing changes, so the gate would never open (it showed as `mem pressure WARN (tolerated)` in the status line). Linux requires `MemAvailable` ≥ `--min-free-mem` % (default 10). Disable with `--no-mem`. Treat the gate as a veto for the genuinely bad case, not as a general memory check.
 - If the load can't be read at all, the gate opens — this tool must never be the reason work didn't happen.
+
+### Niceness (`-n` / `THROTTLED_NICE`)
+
+`-n N` (integer 0–19) runs the command under `nice -n N` once the gate passes; children inherit it, so `yarn build` → node → tsc all give way. The gate says *don't start now*, nice says *if you run anyway, step aside* — so it matters exactly where the gate lets a job onto a busy box: `--then run`, the idle rescue, `--no-mem`. A sensible value is `10`.
+
+- **Good fit:** build, typecheck, lint, seed, migration — a slower run is merely slower.
+- **Bad fit:** vitest/pglite suites and e2e. Their timeouts are wall-clock (30–60 s) and a niced job is the one that loses the CPU race, so under contention it times out *more*. Leave those at the default niceness and cap the workers instead (`--maxWorkers=4`).
+- **It shifts CPU share only.** The job still counts in the load average (the gate sees the same number), and it does nothing for memory pressure or swap. `taskpolicy -b` (macOS) also throttles I/O and pushes the job to the efficiency cores — a heavier hand, not wired into `throttled`.
+- The value is validated up front (a bad one exits 64 before any waiting; lowering niceness needs root), and it also applies under `THROTTLED_DISABLE=1`.
 
 ### Exit codes
 
@@ -74,7 +83,7 @@ disown
 
 ### Escape hatch
 
-`THROTTLED_DISABLE=1` bypasses the gate entirely (CI, or when you know you want it now). Defaults also come from `THROTTLED_PER_CPU`, `THROTTLED_MAX_LOAD`, `THROTTLED_METRIC`, `THROTTLED_INTERVAL`, `THROTTLED_REPORT`, `THROTTLED_MAX_WAIT`, `THROTTLED_MIN_IDLE`, `THROTTLED_MIN_FREE_MEM`, `THROTTLED_QUIET`.
+`THROTTLED_DISABLE=1` bypasses the gate entirely (CI, or when you know you want it now). Defaults also come from `THROTTLED_PER_CPU`, `THROTTLED_MAX_LOAD`, `THROTTLED_METRIC`, `THROTTLED_INTERVAL`, `THROTTLED_REPORT`, `THROTTLED_MAX_WAIT`, `THROTTLED_MIN_IDLE`, `THROTTLED_MIN_FREE_MEM`, `THROTTLED_MEM_LEVEL`, `THROTTLED_NICE`, `THROTTLED_QUIET`.
 
 ## Making it automatic (the whole machine, not just this skill)
 

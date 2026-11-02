@@ -10,7 +10,7 @@
 set -u
 set -o pipefail
 
-VERSION=1.1.0
+VERSION=1.3.0
 PROG=${0##*/}
 
 SLEEP_PID=
@@ -42,12 +42,13 @@ MAX_WAIT_SPEC=${THROTTLED_MAX_WAIT:-}
 METRIC=${THROTTLED_METRIC:-1}
 MIN_IDLE=${THROTTLED_MIN_IDLE:-60}
 MIN_FREE_MEM=${THROTTLED_MIN_FREE_MEM:-10}
+MEM_LEVEL=${THROTTLED_MEM_LEVEL:-critical}
 IDLE_RESCUE=1
 CHECK_MEM=1
 JITTER=1
 QUIET=${THROTTLED_QUIET:-0}
 ON_TIMEOUT=fail
-NICE=
+NICE=${THROTTLED_NICE:-}
 
 usage() {
     cat <<EOF
@@ -79,10 +80,15 @@ OPTIONS
                          first line and the verdict always print)
     -w, --max-wait SPEC  give up after this long (default: wait forever)
         --then run|fail  what --max-wait does when it expires (default $ON_TIMEOUT)
-    -n, --nice N         run the command under nice -n N once the gate passes
+    -n, --nice N         run the command under nice -n N (0-19, higher = politer)
+                         once the gate passes; shifts CPU share only, not the load
         --min-idle P     CPU idle % that overrides a decaying load (default $MIN_IDLE)
         --no-idle-rescue gate on the load average alone
         --min-free-mem P Linux: also require P% MemAvailable (default $MIN_FREE_MEM)
+        --mem-level L    macOS: kernel memory pressure that counts as busy, warn or
+                         critical (default $MEM_LEVEL). A full swap parks the kernel at
+                         warn for hours while the load stays low, so warn is tolerated
+                         unless you ask for it.
         --no-mem         skip the memory gate
         --no-jitter      don't randomise the sleep (jitter decorrelates waiters)
     -c, --check          print the current verdict and exit (0 = ok, 1 = busy)
@@ -100,8 +106,9 @@ EXIT CODES
 ENVIRONMENT
     THROTTLED_PER_CPU, THROTTLED_MAX_LOAD, THROTTLED_METRIC, THROTTLED_INTERVAL,
     THROTTLED_REPORT, THROTTLED_MAX_WAIT, THROTTLED_MIN_IDLE,
-    THROTTLED_MIN_FREE_MEM, THROTTLED_QUIET
+    THROTTLED_MIN_FREE_MEM, THROTTLED_MEM_LEVEL, THROTTLED_NICE, THROTTLED_QUIET
     THROTTLED_DISABLE=1  bypass the gate entirely and just run the command
+                         (--nice still applies)
 
 EXAMPLES
     $PROG yarn build
@@ -152,6 +159,7 @@ while [ $# -gt 0 ]; do
         --then)            need_arg "$1" $#; ON_TIMEOUT=$2; shift 2 ;;
         --min-idle)        need_arg "$1" $#; MIN_IDLE=$2; shift 2 ;;
         --min-free-mem)    need_arg "$1" $#; MIN_FREE_MEM=$2; shift 2 ;;
+        --mem-level)       need_arg "$1" $#; MEM_LEVEL=$2; shift 2 ;;
         --no-idle-rescue)  IDLE_RESCUE=0; shift ;;
         --no-mem)          CHECK_MEM=0; shift ;;
         --no-jitter)       JITTER=0; shift ;;
@@ -173,10 +181,20 @@ case "$ON_TIMEOUT" in
     run|fail) ;;
     *) die "--then must be run or fail (got: $ON_TIMEOUT)" $EX_USAGE ;;
 esac
+case "$MEM_LEVEL" in
+    warn|critical) ;;
+    *) die "--mem-level must be warn or critical (got: $MEM_LEVEL)" $EX_USAGE ;;
+esac
 is_number "$PER_CPU" || die "--per-cpu must be a number (got: $PER_CPU)" $EX_USAGE
 [ -z "$MAX_LOAD" ] || is_number "$MAX_LOAD" || die "--max-load must be a number (got: $MAX_LOAD)" $EX_USAGE
 is_number "$MIN_IDLE" || die "--min-idle must be a number (got: $MIN_IDLE)" $EX_USAGE
 is_number "$MIN_FREE_MEM" || die "--min-free-mem must be a number (got: $MIN_FREE_MEM)" $EX_USAGE
+# nice can only be raised without root, and a bad value must fail now, not after the whole wait
+case "$NICE" in
+    '') ;;
+    *[!0-9]*) die "--nice must be an integer 0-19 (got: $NICE)" $EX_USAGE ;;
+    *) [ "$NICE" -le 19 ] || die "--nice must be an integer 0-19 (got: $NICE)" $EX_USAGE ;;
+esac
 
 INTERVAL=$(parse_duration "$INTERVAL_SPEC") || die "bad --interval: $INTERVAL_SPEC" $EX_USAGE
 REPORT=$(parse_duration "$REPORT_SPEC") || die "bad --report: $REPORT_SPEC" $EX_USAGE
@@ -248,13 +266,20 @@ cpu_idle() {
 
 # Prints "ok|<detail>" or "busy|<detail>". macOS exposes the kernel's own
 # pressure level (1 normal / 2 warn / 4 critical); Linux gets MemAvailable %.
+# WARN blocks only with --mem-level warn: it is where a full swap parks the kernel.
 mem_state() {
     local level pct
     level=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) || level=
     if [ -n "$level" ]; then
         case "$level" in
             1) printf 'ok|mem normal\n' ;;
-            2) printf 'busy|mem pressure WARN\n' ;;
+            2)
+                if [ "$MEM_LEVEL" = warn ]; then
+                    printf 'busy|mem pressure WARN\n'
+                else
+                    printf 'ok|mem pressure WARN (tolerated)\n'
+                fi
+                ;;
             4) printf 'busy|mem pressure CRITICAL\n' ;;
             *) printf 'ok|mem level %s\n' "$level" ;;
         esac
@@ -347,9 +372,16 @@ gate() {
     [ -z "$REASON" ]
 }
 
+run_command() {
+    if [ -n "$NICE" ]; then
+        exec nice -n "$NICE" "$@"
+    fi
+    exec "$@"
+}
+
 if [ "${THROTTLED_DISABLE:-0}" = 1 ] && [ $CHECK_ONLY -eq 0 ]; then
     say "THROTTLED_DISABLE=1 — running without checking"
-    exec "$@"
+    run_command "$@"
 fi
 
 if [ $CHECK_ONLY -eq 1 ]; then
@@ -412,7 +444,4 @@ while :; do
     nap "$NAP"
 done
 
-if [ -n "$NICE" ]; then
-    exec nice -n "$NICE" "$@"
-fi
-exec "$@"
+run_command "$@"
